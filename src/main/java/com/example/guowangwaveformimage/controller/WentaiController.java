@@ -1,10 +1,9 @@
 package com.example.guowangwaveformimage.controller;
 
-/* 
-    @author nanchao 
+/*
+    @author nanchao
     @date 2025/8/14
 */
-
 
 import org.bytedeco.javacpp.Loader;
 import org.bytedeco.opencv.opencv_java;
@@ -23,65 +22,74 @@ import org.springframework.web.multipart.MultipartFile;
 import java.util.*;
 import java.util.stream.Collectors;
 
-
 @RestController
 @RequestMapping("/wentai")
 public class WentaiController {
 
-
-    // opencv 加载
     static {
         try {
-            // 让 JavaCPP 自动解包并加载正确的本地库
             Loader.load(opencv_java.class);
             System.out.println("OpenCV native libs loaded by JavaCPP.");
         } catch (Throwable e) {
             e.printStackTrace();
-            // 失败时抛出，方便尽早发现问题（不要只吞掉异常）
             throw new RuntimeException("Failed to load OpenCV native libraries", e);
         }
     }
 
-
-    // 配置
+    // 三相 ROI
     private static final Rect ROI_A = new Rect(55, 56, 1400, 310);
     private static final Rect ROI_B = new Rect(55, 370, 1400, 310);
     private static final Rect ROI_C = new Rect(55, 683, 1400, 310);
 
-    private static final double PER_SEGMENT_VALUE = 200000.0;   // 每段代表的幅值(V)
-    private static final int    DASH_FALLBACK_PIXELS = 300;      // 找不到刻度时的兜底像素
-    private static final double STEADY_WINDOW_RIGHT_PORTION = 0.40; // 只取右侧40%做稳态
-    private static final int    HSV_S_THRESH = 40;               // 波形像素筛选：S阈
-    private static final int    HSV_V_THRESH = 40;               // 波形像素筛选：V阈
+    // 刻度：电压每段200000（V），电流每段500（A）
+    private static final double VOLT_PER_SEG = 200000.0;
+    private static final double CURR_PER_SEG = 500.0;
 
-    //返回结构
+    private static final int    DASH_FALLBACK_PIXELS = 300;
+    private static final double STEADY_WINDOW_RIGHT_PORTION = 0.40;   // 右侧40%
+    private static final int    HSV_S_THRESH = 40;
+    private static final int    HSV_V_THRESH = 40;
+
+    // 返回结构
     public static class PhaseResult {
         public String phase;            // A/B/C
-        public Double steadyPeakV;      // 稳态峰值(相对中线的幅值, V)
-        public Double steadyRmsV;       // 稳态RMS(=峰值/√2 假设正弦)
-        public Double sampleRmsV;       // 采样RMS(从稳态窗口样本直接算)
-        public String  error;           // 错误信息（若有）
+        public Double steadyPeakV;      // 稳态峰值（已按单位换算：电压=kV，电流=A）
+        public Double steadyRmsV;       // 稳态RMS（同上单位，且为正）
+        public Double sampleRmsV;       // 采样RMS（同上单位，且为正）
+        public String  error;
         public Map<String, Object> debug = new LinkedHashMap<>();
     }
-
     public static class FileResult {
         public String file;
+        public String mode;             // "voltage" / "current"
+        public String unit;             // "kV" / "A"
         public List<PhaseResult> phases = new ArrayList<>();
     }
 
-
     @PostMapping("/upload")
-    public ResponseEntity<?> uploadImages(@RequestParam("files") MultipartFile[] files) {
-        List<FileResult> out = Arrays.stream(files).map(this::analyzeOneFile)
+    public ResponseEntity<?> uploadImages(@RequestParam("files") MultipartFile[] files,
+                                          @RequestParam(value = "mode", defaultValue = "voltage") String mode) {
+
+        final boolean isVoltage = !"current".equalsIgnoreCase(mode);
+        final double perSegmentValue = isVoltage ? VOLT_PER_SEG : CURR_PER_SEG;
+        final double displayScale = isVoltage ? (1.0 / 1000.0) : 1.0; // 电压转kV；电流保持A
+
+        List<FileResult> out = Arrays.stream(files)
+                .map(f -> analyzeOneFile(f, perSegmentValue, isVoltage, displayScale, mode))
                 .collect(Collectors.toList());
         return ResponseEntity.ok(out);
     }
 
-
     /* ==================== 主流程：单文件 -> 三相稳态 ==================== */
-    private FileResult analyzeOneFile(MultipartFile file) {
+    private FileResult analyzeOneFile(MultipartFile file,
+                                      double perSegmentValue,
+                                      boolean isVoltage,
+                                      double displayScale,
+                                      String mode) {
         FileResult r = new FileResult();
         r.file = file.getOriginalFilename();
+        r.mode = mode;
+        r.unit = isVoltage ? "kV" : "A";
 
         Mat img = null;
         try {
@@ -95,9 +103,9 @@ public class WentaiController {
                 return r;
             }
 
-            r.phases.add(analyzeSteadyOnePhase(img.submat(ROI_A), "A"));
-            r.phases.add(analyzeSteadyOnePhase(img.submat(ROI_B), "B"));
-            r.phases.add(analyzeSteadyOnePhase(img.submat(ROI_C), "C"));
+            r.phases.add(analyzeSteadyOnePhase(img.submat(ROI_A), "A", perSegmentValue, isVoltage, displayScale));
+            r.phases.add(analyzeSteadyOnePhase(img.submat(ROI_B), "B", perSegmentValue, isVoltage, displayScale));
+            r.phases.add(analyzeSteadyOnePhase(img.submat(ROI_C), "C", perSegmentValue, isVoltage, displayScale));
 
         } catch (Exception e) {
             r.phases.add(errPhase("A", e.getMessage()));
@@ -110,11 +118,15 @@ public class WentaiController {
     }
 
     /* ==================== 单相稳态分析 ==================== */
-    private PhaseResult analyzeSteadyOnePhase(Mat roi, String phaseName) {
+    private PhaseResult analyzeSteadyOnePhase(Mat roi,
+                                              String phaseName,
+                                              double perSegmentValue,
+                                              boolean isVoltage,
+                                              double displayScale) {
         PhaseResult pr = new PhaseResult();
         pr.phase = phaseName;
 
-        // 1) 找三条横向黑实线（上/中/下）
+        // 1) 三条黑实线
         List<Integer> blackLines = detectHorizontalBlackLines(roi, 0.6);
         if (blackLines.size() < 3) {
             pr.error = "检测到的黑实线不足3条";
@@ -124,13 +136,13 @@ public class WentaiController {
         Collections.sort(blackLines);
         int y1 = blackLines.get(0), y2 = blackLines.get(blackLines.size()/2), y3 = blackLines.get(blackLines.size()-1);
 
-        // 2) 找横向虚线刻度（用于像素->电压的标定）
+        // 2) 虚线刻度
         List<Integer> dashYs = detectHorizontalDashLines(roi, y1, y3);
 
-        // 3) 逐列跟踪波形 y(x)，只在 y1~y3 范围
+        // 3) 跟踪波形 y(x)
         int[] yTrace = traceWaveYPerColumn(roi, y1, y3);
 
-        // 4) 取右侧稳态窗口
+        // 4) 右侧 40% 窗口
         int w = roi.width();
         int xStart = (int)Math.round(w * (1.0 - STEADY_WINDOW_RIGHT_PORTION));
         xStart = Math.max(0, Math.min(w-1, xStart));
@@ -144,34 +156,39 @@ public class WentaiController {
             return pr;
         }
 
-        // 5) 在窗口内找峰值/谷值（距中线更大的那个视为稳态峰值）
+        // 5) 找峰/谷，取离中线更远的
         int ymax = ys.stream().max(Integer::compareTo).orElse(y2);
         int ymin = ys.stream().min(Integer::compareTo).orElse(y2);
-        // 与中线的像素偏差
-        int devTop    = Math.abs(ymin - y2); // 上峰（像素更小）
-        int devBottom = Math.abs(ymax - y2); // 下峰
+        int devTop    = Math.abs(ymin - y2);
+        int devBottom = Math.abs(ymax - y2);
         int peakY = (devTop >= devBottom) ? ymin : ymax;
+        boolean isUp = (devTop >= devBottom);
 
-        // 6) 像素 -> 电压（分段+线性插值；找不到刻度就用兜底像素）
-        double steadyPeakV = pixelToVoltByDashes(peakY, y2, dashYs);
+        // 6) 像素 -> 物理量（V 或 A）
+        double peakVal = pixelToValueByDashes(peakY, y2, dashYs, perSegmentValue, DASH_FALLBACK_PIXELS, isUp);
 
-        // 7) RMS(假设正弦) = 峰值/√2
-        double steadyRms = steadyPeakV / Math.sqrt(2.0);
+        // 7) 有效值（正）：理论 RMS = |peak|/√2
+        double steadyRms = Math.abs(peakVal) / Math.sqrt(2.0);
 
-        // 8) 采样RMS（把窗口内每个 y 映射成电压，再直接算 RMS，抗失真）
-        double[] vSamples = new double[w - xStart];
+        // 8) 采样 RMS（正）：窗口内逐点换算，再算 RMS
+        double[] samples = new double[w - xStart];
         int idx = 0;
         for (int x = xStart; x < w; x++) {
             int yy = yTrace[x];
-            if (yy >= 0) vSamples[idx++] = pixelToVoltByDashes(yy, y2, dashYs);
+            if (yy >= 0) {
+                boolean upHere = yy < y2;
+                double val = pixelToValueByDashes(yy, y2, dashYs, perSegmentValue, DASH_FALLBACK_PIXELS, upHere);
+                samples[idx++] = Math.abs(val); // 取绝对值，保证RMS为正
+            }
         }
-        double sampleRms = calcRms(vSamples, idx); // 只对有效样本计
+        double sampleRms = calcRms(samples, idx);
 
-        pr.steadyPeakV = steadyPeakV;
-        pr.steadyRmsV  = steadyRms;
-        pr.sampleRmsV  = sampleRms;
+        // 9) 按显示单位输出：电压->kV，电流->A
+        pr.steadyPeakV = peakVal * displayScale;
+        pr.steadyRmsV  = steadyRms * displayScale;
+        pr.sampleRmsV  = sampleRms * displayScale;
 
-        // debug信息便于调参
+        // 调参信息
         pr.debug.put("y1y2y3", Arrays.asList(y1,y2,y3));
         pr.debug.put("dashYs", dashYs);
         pr.debug.put("xStart", xStart);
@@ -181,7 +198,7 @@ public class WentaiController {
 
     /* ==================== 工具函数 ==================== */
 
-    // 基于水平投影+二值化找“长黑横线”
+    // 找长黑横线（实线）
     private List<Integer> detectHorizontalBlackLines(Mat roi, double runRatioThresh) {
         Mat gray = new Mat(); Imgproc.cvtColor(roi, gray, Imgproc.COLOR_BGR2GRAY);
         Mat bin  = new Mat(); Imgproc.threshold(gray, bin, 0, 255, Imgproc.THRESH_BINARY_INV + Imgproc.THRESH_OTSU);
@@ -200,14 +217,13 @@ public class WentaiController {
                     if (blackRun > maxRun) maxRun = blackRun;
                 } else blackRun = 0;
             }
-            // 若该行存在较长连续黑段（例如占宽度 60%）
             if (maxRun >= w * runRatioThresh) lines.add(y);
         }
         gray.release(); bin.release();
         return lines;
     }
 
-    // 在 [y1,y3] 范围内找“虚线刻度”：按行统计黑像素密度，取多个峰值行
+    // 找虚线刻度
     private List<Integer> detectHorizontalDashLines(Mat roi, int y1, int y3) {
         Mat gray = new Mat(); Imgproc.cvtColor(roi, gray, Imgproc.COLOR_BGR2GRAY);
         Mat bin  = new Mat(); Imgproc.adaptiveThreshold(gray, bin, 255, Imgproc.ADAPTIVE_THRESH_MEAN_C,
@@ -256,7 +272,7 @@ public class WentaiController {
         return merged;
     }
 
-    // 逐列提取“波形代表y”：在 y1~y3 中寻找 S/V 足够的像素（近似波形颜色）
+    // 按列追踪波形 y
     private int[] traceWaveYPerColumn(Mat roi, int y1, int y3) {
         Mat hsv = new Mat(); Imgproc.cvtColor(roi, hsv, Imgproc.COLOR_BGR2HSV);
         int h = roi.rows(), w = roi.cols();
@@ -290,52 +306,55 @@ public class WentaiController {
         return sm;
     }
 
-    // 把某个 y 映射到电压值（V）：以中线 y2 为 0，上方为正
-    private double pixelToVoltByDashes(int y, int y2, List<Integer> dashYs) {
+    // y -> 物理量（上方正，下方负）
+    private double pixelToValueByDashes(int y, int y2, List<Integer> dashYs,
+                                        double perSeg, int fallbackPixels, boolean isUp) {
         if (y < 0) return Double.NaN;
-        if (y < y2) { // 上方：正
-            int prev = y2; int section = 0;
+
+        List<Integer> all = new ArrayList<>(dashYs);
+        all.add(y2);
+        Collections.sort(all);
+
+        if (isUp) {
             List<Integer> up = new ArrayList<>();
-            for (int d : dashYs) if (d < y2) up.add(d);
-            Collections.sort(up, Comparator.reverseOrder()); // 从近到远：y2上方最近的开始
+            for (int d: all) if (d < y2) up.add(d);
+            up.sort(Collections.reverseOrder());
+            int prev = y2, section = 0;
             for (int d : up) {
                 if (y <= d) {
                     double ratio = (prev - y) * 1.0 / (prev - d);
-                    return section * PER_SEGMENT_VALUE + ratio * PER_SEGMENT_VALUE;
+                    return section * perSeg + ratio * perSeg;
                 }
                 prev = d; section++;
             }
-            // 超出最上面一段
             if (!up.isEmpty()) {
-                double ratio = (prev - y) * 1.0 / (prev - up.get(up.size() - 1));
-                return section * PER_SEGMENT_VALUE + ratio * PER_SEGMENT_VALUE;
+                double ratio = (prev - y) * 1.0 / (prev - up.get(up.size()-1));
+                return section * perSeg + ratio * perSeg;
             } else {
-                return (y2 - y) * PER_SEGMENT_VALUE / DASH_FALLBACK_PIXELS;
+                return (y2 - y) * perSeg / fallbackPixels;
             }
-        } else if (y == y2) {
-            return 0.0;
-        } else { // 下方：负
-            int prev = y2; int section = 0;
+        } else {
             List<Integer> down = new ArrayList<>();
-            for (int d : dashYs) if (d > y2) down.add(d);
-            Collections.sort(down); // 从近到远
+            for (int d: all) if (d > y2) down.add(d);
+            Collections.sort(down);
+            int prev = y2, section = 0;
             for (int d : down) {
                 if (y >= d) {
                     double ratio = (y - prev) * 1.0 / (d - prev);
-                    return -(section * PER_SEGMENT_VALUE + ratio * PER_SEGMENT_VALUE);
+                    return -(section * perSeg + ratio * perSeg);
                 }
                 prev = d; section++;
             }
             if (!down.isEmpty()) {
-                double ratio = (y - prev) * 1.0 / (down.get(down.size() - 1) - prev);
-                return -(section * PER_SEGMENT_VALUE + ratio * PER_SEGMENT_VALUE);
+                double ratio = (y - prev) * 1.0 / (down.get(down.size()-1) - prev);
+                return -(section * perSeg + ratio * perSeg);
             } else {
-                return -(y - y2) * PER_SEGMENT_VALUE / DASH_FALLBACK_PIXELS;
+                return -(y - y2) * perSeg / fallbackPixels;
             }
         }
     }
 
-    // 采样RMS（对有效样本前 idx 个）
+    // RMS（对前 validCount 个样本；样本值已取绝对）
     private double calcRms(double[] arr, int validCount) {
         if (validCount <= 0) return Double.NaN;
         double s=0; int c=0;
@@ -351,5 +370,4 @@ public class WentaiController {
         p.phase = phase; p.error = msg;
         return p;
     }
-
 }

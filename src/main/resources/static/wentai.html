@@ -42,6 +42,17 @@
             border-color: #23cc97;
             background: #f5fff8;
         }
+        .mode-row {
+            display: flex;
+            gap: 16px;
+            align-items: center;
+            color: #156b50;
+            font-weight: 600;
+        }
+        .mode-row label {
+            cursor: pointer;
+            user-select: none;
+        }
         button, #downloadWordBtn {
             background: linear-gradient(90deg, #1db37b 0%, #a5eddc 100%);
             border: none;
@@ -113,6 +124,14 @@
 <h2>波形图像稳态值识别</h2>
 <form id="uploadForm">
     <input type="file" id="fileInput" name="files" multiple accept="image/*">
+
+    <!-- 新增：模式选择（电压/电流） -->
+    <div class="mode-row">
+        <span>模式：</span>
+        <label><input type="radio" name="mode" value="voltage" checked> 电压</label>
+        <label><input type="radio" name="mode" value="current"> 电流</label>
+    </div>
+
     <button type="submit">上传</button>
 </form>
 <hr>
@@ -124,6 +143,8 @@
 
 <script src="https://cdn.jsdelivr.net/npm/docx@8.5.0/build/index.umd.js"></script>
 <script>
+    // 当前选择的模式（用于切换单位显示）
+    let currentMode = 'voltage';
     // 记录最近一次渲染的数据
     let lastTableData = [];
 
@@ -136,10 +157,15 @@
             return;
         }
 
+        // 读取当前选择的模式
+        currentMode = document.querySelector('input[name="mode"]:checked').value;
+
         const formData = new FormData();
         for(let i = 0; i < files.length; i++) {
             formData.append('files', files[i]);
         }
+        // 将模式传给后端
+        formData.append('mode', currentMode);
 
         fetch('/wentai/upload', {
             method: 'POST',
@@ -152,22 +178,27 @@
             });
     });
 
-    // 渲染表格（稳态字段：steadyPeakV / steadyRmsV / sampleRmsV）
+    function unitLabel(){
+        return currentMode === 'current' ? 'A' : 'V';
+    }
+
+    // 渲染表格（稳态字段：steadyPeakV / steadyRmsV / sampleRmsV；不再除以1000）
     function renderTable(data) {
         lastTableData = data;
         if (!Array.isArray(data) || data.length === 0) {
             document.getElementById('result').innerText = '没有结果';
             return;
         }
+        const u = unitLabel();
         let html = `
         <table>
             <thead>
                 <tr>
                     <th>文件名</th>
                     <th>相别</th>
-                    <th>稳态峰值(kV)</th>
-                    <th>理论RMS(kV)</th>
-                    <th>采样RMS(kV)</th>
+                    <th>稳态峰值(${u})</th>
+                    <th>理论RMS(${u})</th>
+                    <th>采样RMS(${u})</th>
                     <th>异常信息</th>
                 </tr>
             </thead>
@@ -189,7 +220,7 @@
 
             for (let i = 0; i < phases.length; i++) {
                 const p = phases[i] || {};
-                // 兼容老字段：若 steadyPeakV 缺失，尝试从 value 回退
+                // 兼容：若 steadyPeakV 缺失，尝试从 value 回退
                 const peakV   = getNumberOrNull(p.steadyPeakV, p.value);
                 const rmsV    = getNumberOrNull(p.steadyRmsV, (peakV != null ? peakV / Math.SQRT2 : null));
                 const sampleR = getNumberOrNull(p.sampleRmsV, null);
@@ -199,9 +230,9 @@
                     html += `<td rowspan="${rowSpan}">${fileName}</td>`;
                 }
                 html += `<td>${p.phase ?? ''}</td>`;
-                html += `<td>${formatKV(peakV)}</td>`;
-                html += `<td>${formatKV(rmsV)}</td>`;
-                html += `<td>${formatKV(sampleR)}</td>`;
+                html += `<td>${formatVal(peakV)}</td>`;
+                html += `<td>${formatVal(rmsV)}</td>`;
+                html += `<td>${formatVal(sampleR)}</td>`;
                 html += `<td style="color:red">${p.error ? p.error : ''}</td>`;
                 html += `</tr>`;
             }
@@ -216,12 +247,13 @@
         }
         return null;
     }
-    function formatKV(v){
+    function formatVal(v){
         if (v == null) return '';
-        return (v/1000).toFixed(2);
+        // 保留两位小数即可，不做 1e3 缩放
+        return Number(v).toFixed(2);
     }
 
-    // 导出 Word（与表格列保持一致）
+    // 导出 Word（与表格列保持一致，单位动态变化）
     document.getElementById('downloadWordBtn').onclick = async function () {
         if (!lastTableData || lastTableData.length === 0) {
             alert("请先上传并识别图片！");
@@ -233,13 +265,14 @@
     async function exportTableToWord(data) {
         const { Document, Packer, Paragraph, Table, TableRow, TableCell, WidthType, AlignmentType } = window.docx;
 
+        const u = unitLabel();
         const headerRow = new TableRow({
             children: [
                 new TableCell({ children: [new Paragraph("文件名")] }),
                 new TableCell({ children: [new Paragraph("相别")] }),
-                new TableCell({ children: [new Paragraph("稳态峰值(kV)")] }),
-                new TableCell({ children: [new Paragraph("理论RMS(kV)")] }),
-                new TableCell({ children: [new Paragraph("采样RMS(kV)")] })
+                new TableCell({ children: [new Paragraph(`稳态峰值(${u})`)] }),
+                new TableCell({ children: [new Paragraph(`理论RMS(${u})`)] }),
+                new TableCell({ children: [new Paragraph(`采样RMS(${u})`)] })
             ]
         });
 
@@ -269,9 +302,9 @@
                     children: [
                         new TableCell({ children: [new Paragraph(fileName)] }),
                         new TableCell({ children: [new Paragraph(p.phase ?? "")] }),
-                        new TableCell({ children: [new Paragraph(peakV != null ? (peakV/1000).toFixed(2) : "")] }),
-                        new TableCell({ children: [new Paragraph(rmsV  != null ? (rmsV /1000).toFixed(2) : "")] }),
-                        new TableCell({ children: [new Paragraph(sampleR!= null ? (sampleR/1000).toFixed(2) : "")] }),
+                        new TableCell({ children: [new Paragraph(peakV != null ? formatVal(peakV) : "")] }),
+                        new TableCell({ children: [new Paragraph(rmsV  != null ? formatVal(rmsV ) : "")] }),
+                        new TableCell({ children: [new Paragraph(sampleR!= null ? formatVal(sampleR) : "")] }),
                     ]
                 }));
             }
