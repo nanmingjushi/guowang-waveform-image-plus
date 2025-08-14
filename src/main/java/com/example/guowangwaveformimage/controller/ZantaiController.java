@@ -33,7 +33,10 @@ public class ZantaiController {
 
 
     @PostMapping("/upload")
-    public ResponseEntity<?> uploadImages(@RequestParam("files") MultipartFile[] files) {
+    public ResponseEntity<?> uploadImages(@RequestParam("files") MultipartFile[] files,@RequestParam(value="mode", defaultValue="voltage") String mode) {
+
+        // ★改动：根据模式选择每段物理量（电压=200000，电流=500）
+        final double perSegmentValue = "current".equalsIgnoreCase(mode) ? 500.0 : 200000.0;
 
         List<Map<String, Object>> allResults = new ArrayList<>();
 
@@ -67,10 +70,12 @@ public class ZantaiController {
                 Mat[] images = {img1, img2, img3};
                 List<Map<String, Object>> phaseResults = new ArrayList<>();
                 for (int i = 0; i < 3; i++) {
-                    Map<String, Object> r = analyzePhase(images[i], names[i]);
+                    // ★改动：把 perSegmentValue 传入
+                    Map<String, Object> r = analyzePhase(images[i], names[i], perSegmentValue);
                     phaseResults.add(r);
                     // 控制台输出
-                    System.out.println("文件 " + baseName + " 相" + names[i] + "：最大值=" + r.get("value") + ", 最高点y=" + r.get("wave_top_y"));
+                    System.out.println("文件 " + baseName + " 相" + names[i] +
+                            "：最大值=" + r.get("value") + ", 最高点y=" + r.get("wave_top_y"));
                 }
 
                 Map<String, Object> fileResult = new LinkedHashMap<>();
@@ -86,7 +91,7 @@ public class ZantaiController {
         return ResponseEntity.ok(allResults);
     }
 
-    public Map<String, Object> analyzePhase(Mat part, String phaseName) {
+    public Map<String, Object> analyzePhase(Mat part, String phaseName, double perSegmentValue) {
         // 检测三条黑实线
         List<Integer> lineY = detectHorizontalBlackLines(part, 0.6);
         if (lineY.size() < 3) {
@@ -103,7 +108,8 @@ public class ZantaiController {
         // 只在y1~y3之间检测彩色波形最高点
         int waveTopY = findWaveformTopY(part, y1, y3);
         boolean isUp = waveTopY < y2;
-        double value = calcMaxValueByDashes(y2, dashLines, waveTopY, isUp);
+
+        double value = calcMaxValueByDashes(y2, dashLines, waveTopY, isUp, perSegmentValue);
 
         return Map.of(
                 "phase", phaseName,
@@ -189,7 +195,7 @@ public class ZantaiController {
     /**
      * 计算最大值，基于0轴（中间实线）、所有虚线（升序）、波形最高点
      */
-    public double calcMaxValueByDashes(int y2, List<Integer> dashLines, int waveTopY, boolean isUp) {
+    public double calcMaxValueByDashes(int y2, List<Integer> dashLines, int waveTopY, boolean isUp,double perSegmentValue) {
         // 0轴和虚线全部合到一起，排序
         List<Integer> allY = new ArrayList<>(dashLines);
         allY.add(y2);
@@ -205,7 +211,7 @@ public class ZantaiController {
             for (int y : up) {
                 if (waveTopY <= y) {
                     double ratio = (prev - waveTopY) * 1.0 / (prev - y);
-                    return section * 200000 + ratio * 200000;
+                    return section * perSegmentValue + ratio * perSegmentValue;
                 }
                 prev = y;
                 section++;
@@ -213,9 +219,9 @@ public class ZantaiController {
             // 超出最上面一段
             if (!up.isEmpty()) {
                 double ratio = (prev - waveTopY) * 1.0 / (prev - up.get(up.size() - 1));
-                return section * 200000 + ratio * 200000;
+                return section * perSegmentValue + ratio * perSegmentValue;
             } else {
-                return (y2 - waveTopY) * 200000.0 / (y2 - 0); // 没虚线就兜底
+                return (y2 - waveTopY) * perSegmentValue / (y2 - 0+1e-9); // 没虚线就兜底
             }
         } else {
             List<Integer> down = new ArrayList<>();
@@ -227,7 +233,7 @@ public class ZantaiController {
             for (int y : down) {
                 if (waveTopY >= y) {
                     double ratio = (waveTopY - prev) * 1.0 / (y - prev);
-                    return -(section * 200000 + ratio * 200000);
+                    return -(section * perSegmentValue + ratio * perSegmentValue);
                 }
                 prev = y;
                 section++;
@@ -235,9 +241,9 @@ public class ZantaiController {
             // 超出最下面一段
             if (!down.isEmpty()) {
                 double ratio = (waveTopY - prev) * 1.0 / (down.get(down.size() - 1) - prev);
-                return -(section * 200000 + ratio * 200000);
+                return -(section * perSegmentValue + ratio * perSegmentValue);
             } else {
-                return -(waveTopY - y2) * 200000.0 / (300); // 兜底，假设最下面实线与0轴相距300像素
+                return -(waveTopY - y2) * perSegmentValue / (300.0); // 兜底，假设最下面实线与0轴相距300像素
             }
         }
     }

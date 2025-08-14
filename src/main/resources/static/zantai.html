@@ -115,6 +115,14 @@
 <h2>波形图像暂态最大值识别</h2>
 <form id="uploadForm">
     <input type="file" id="fileInput" name="files" multiple accept="image/*">
+
+    <!-- 模式选择 -->
+    <div style="margin:8px 0 2px;">
+        <label><input type="radio" name="mode" value="voltage" checked> 电压</label>
+        &nbsp;&nbsp;
+        <label><input type="radio" name="mode" value="current"> 电流</label>
+    </div>
+
     <button type="submit">上传</button>
 </form>
 <hr>
@@ -141,6 +149,8 @@
         const formData = new FormData();
         for(let i = 0; i < files.length; i++) {
             formData.append('files', files[i]);
+            const mode = document.querySelector('input[name="mode"]:checked').value;
+            formData.append('mode', mode);
         }
 
         fetch('/zantai/upload', {
@@ -169,7 +179,7 @@
                 <tr>
                     <th>文件名</th>
                     <th>相别</th>
-                    <th>物理量最大值(k)</th>
+                    <th>物理量最大值</th>
                     <th>像素最高点y(pixel)</th>
                     <th>异常信息</th>
                 </tr>
