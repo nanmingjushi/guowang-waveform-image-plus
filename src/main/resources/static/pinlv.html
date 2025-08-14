@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <title>频率计算</title>
+    <style>
+        body {
+            background: #fafbfc;
+            min-height: 100vh;
+            font-family: 'Segoe UI', 'Microsoft YaHei', Arial, sans-serif;
+            color: #1d272b;
+            margin: 0;
+        }
+        h2 {
+            color: #1d9276;
+            text-align: center;
+            margin-bottom: 28px;
+            margin-top: 32px;
+            font-size: 2em;
+            letter-spacing: 2px;
+            font-weight: 600;
+        }
+        form {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin-bottom: 12px;
+            gap: 8px;
+        }
+        #fileInput {
+            padding: 10px 18px;
+            border-radius: 15px;
+            border: 1.5px solid #d7ece0;
+            background: #fff;
+            color: #168c60;
+            font-size: 1em;
+            outline: none;
+            margin-bottom: 8px;
+            transition: border-color 0.2s;
+        }
+        #fileInput:focus {
+            border-color: #23cc97;
+            background: #f5fff8;
+        }
+        button, #downloadWordBtn {
+            background: linear-gradient(90deg, #1db37b 0%, #a5eddc 100%);
+            border: none;
+            color: #176c4e;
+            padding: 11px 36px;
+            border-radius: 24px;
+            font-size: 1.08em;
+            font-weight: bold;
+            cursor: pointer;
+            margin-bottom: 10px;
+            letter-spacing: 1px;
+            box-shadow: 0 2px 12px #a0ede7aa;
+            transition: background 0.15s, transform 0.15s;
+        }
+        button:hover, #downloadWordBtn:hover {
+            background: linear-gradient(90deg, #23cc97 0%, #b8fae2 100%);
+            color: #0b4236;
+            transform: translateY(-2px) scale(1.035);
+        }
+        hr {
+            border: 0;
+            border-top: 1px solid #e6ebe9;
+            margin: 20px 0;
+        }
+        table {
+            border-collapse: collapse;
+            margin: 26px auto 0 auto;
+            width: 100%;
+            max-width: 700px;       /* 让表格最多700px宽 */
+            min-width: 320px;
+            box-shadow: 0 2px 20px #e6f9f6cc;
+            border-radius: 12px;
+            background: #fff;
+            overflow: hidden;
+            font-size: 1.07em;
+        }
+        th, td {
+            border: none;
+            padding: 13px 8px;
+            text-align: center;
+        }
+        th {
+            background: #ecfaf6;
+            color: #189c72;
+            font-size: 1.08em;
+            font-weight: 700;
+            letter-spacing: 1px;
+        }
+        tr:not(:last-child) td {
+            border-bottom: 1px solid #f2f4f4;
+        }
+        td {
+            background: transparent;
+            color: #273b37;
+            font-size: 1.07em;
+        }
+        td[style*="color:red"] {
+            color: #e84d3d !important;
+            font-weight: bold;
+        }
+        @media (max-width: 900px) {
+            table { font-size: 0.97em;}
+            th, td { padding: 7px 2px; }
+            table { max-width: 99vw; }
+        }
+
+    </style>
+
+</head>
+<body>
+<h2>频率计算</h2>
+<form id="uploadForm">
+    <input type="file" id="fileInput" name="files" multiple accept="image/*">
+    <button type="submit">上传</button>
+</form>
+<hr>
+<div id="result"></div>
+
+<div>
+    <button id="downloadWordBtn" style="margin-left:16px;">导出结果表格到Word</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/docx@8.5.0/build/index.umd.js"></script>
+<script>
+    // 记录最近一次渲染的数据
+    let lastTableData = [];
+
+    document.getElementById('uploadForm').addEventListener('submit', function(e){
+        e.preventDefault();
+
+        const files = document.getElementById('fileInput').files;
+        if (files.length === 0) {
+            alert("请先选择图片！");
+            return;
+        }
+
+        const formData = new FormData();
+        for(let i = 0; i < files.length; i++) {
+            formData.append('files', files[i]);
+        }
+
+        fetch('/api/upload', {
+            method: 'POST',
+            body: formData
+        })
+            .then(response => response.json())
+            .then(data => {
+                renderTable(data);
+            })
+            .catch(error => {
+                document.getElementById('result').innerText = '上传失败: ' + error;
+            });
+    });
+
+    // 表格渲染和数据同步
+    function renderTable(data) {
+        lastTableData = data;  // 记录最新数据
+        if (!Array.isArray(data) || data.length === 0) {
+            document.getElementById('result').innerText = '没有结果';
+            return;
+        }
+        let html = `
+        <table>
+            <thead>
+                <tr>
+                    <th>文件名</th>
+                    <th>相别</th>
+                    <th>物理量最大值(k)</th>
+                    <th>像素最高点y(pixel)</th>
+                    <th>异常信息</th>
+                </tr>
+            </thead>
+            <tbody>
+        `;
+        for (let file of data) {
+            let fileName = file.file;
+            let phases = Array.isArray(file.phases) ? file.phases : [];
+            let rowSpan = phases.length > 0 ? phases.length : 1;
+
+            if (phases.length === 0) {
+                html += `<tr>
+                    <td>${fileName}</td>
+                    <td colspan="4" style="color:red">未检测到任何相别数据</td>
+                </tr>`;
+                continue;
+            }
+
+            for (let i = 0; i < phases.length; i++) {
+                let phase = phases[i];
+                html += `<tr>`;
+                // 只在第一行显示文件名
+                if (i === 0) {
+                    html += `<td rowspan="${rowSpan}">${fileName}</td>`;
+                }
+                html += `<td>${phase.phase || ''}</td>`;
+                html += `<td>${phase.value !== undefined ? (phase.value / 1000).toFixed(2) : ''}</td>`;
+                html += `<td>${phase.wave_top_y !== undefined ? phase.wave_top_y : ''}</td>`;
+                html += `<td style="color:red">${phase.error ? phase.error : ''}</td>`;
+                html += `</tr>`;
+            }
+        }
+        html += `</tbody></table>`;
+        document.getElementById('result').innerHTML = html;
+    }
+
+    // 点击导出Word
+    document.getElementById('downloadWordBtn').onclick = function() {
+        if (!lastTableData || lastTableData.length === 0) {
+            alert("请先上传并识别图片！");
+            return;
+        }
+        exportTableToWord(lastTableData);
+    };
+
+    // 表格导出为Word函数
+    async function exportTableToWord(data) {
+        const { Document, Packer, Paragraph, Table, TableRow, TableCell, WidthType, AlignmentType } = window.docx;
+        let rows = [
+            new TableRow({
+                children: [
+                    new TableCell({children: [new Paragraph("文件名")]}),
+                    new TableCell({children: [new Paragraph("相别")]}),
+                    new TableCell({children: [new Paragraph("物理量最大值(k)")] }),
+
+                ]
+            })
+        ];
+
+        for (let file of data) {
+            let fileName = file.file;
+            let phases = Array.isArray(file.phases) ? file.phases : [];
+            if (phases.length === 0) {
+                rows.push(new TableRow({
+                    children: [
+                        new TableCell({children: [new Paragraph(fileName)]}),
+                        new TableCell({children: [new Paragraph("无")]}),
+                        new TableCell({children: [new Paragraph("")]})
+
+
+                    ]
+                }));
+                continue;
+            }
+            for (let i = 0; i < phases.length; i++) {
+                let phase = phases[i];
+                rows.push(new TableRow({
+                    children: [
+                        new TableCell({children: [new Paragraph(fileName)]}),
+                        new TableCell({children: [new Paragraph(phase.phase || "")]}),
+                        new TableCell({children: [new Paragraph(
+                                phase.value !== undefined
+                                    ? (phase.value / 1000).toFixed(2)
+                                    : ""
+                            )]}),
+                    ]
+                }));
+            }
+        }
+
+        const table = new Table({
+            rows,
+            width: {size: 100, type: WidthType.PERCENTAGE}
+        });
+
+        const doc = new Document({
+            sections: [{
+                children: [
+                    new Paragraph({
+                        text: "波形图像暂态最大值识别",
+                        heading: "Heading1",
+                        alignment: AlignmentType.CENTER
+                    }),
+                    table
+                ]
+            }]
+        });
+
+        const blob = await Packer.toBlob(doc);
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = '波形图像暂态最大值识别.docx';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    }
+
+</script>
+
+
+
+
+</body>
+</html>
